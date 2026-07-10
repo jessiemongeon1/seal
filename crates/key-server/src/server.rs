@@ -95,7 +95,7 @@ mod seal_package;
 pub mod tests;
 mod time;
 
-const GAS_BUDGET: u64 = 500_000_000;
+const MAX_COMPUTATION_UNITS: u64 = 55_000; // 50K tier + 10% extra buffer
 const GIT_VERSION: &str = crate::git_version!();
 const DEFAULT_PORT: u16 = 2024;
 
@@ -205,9 +205,11 @@ impl Server {
     }
 
     async fn new(mut options: KeyServerOptions, metrics: Option<Arc<KeyServerMetrics>>) -> Self {
-        // The legacy JSON-RPC client is only used by the event monitors, only
-        // initialize it when event monitoring is enabled.
-        let sui_client = if options.enable_event_monitoring {
+        // The legacy JSON-RPC client is only used by the event monitors, which
+        // only run in committee mode. Only initialize it when event monitoring
+        // is enabled and the server is in committee mode.
+        let is_committee_mode = matches!(options.server_mode, ServerMode::Committee { .. });
+        let sui_client = if options.enable_event_monitoring && is_committee_mode {
             info!("Event monitoring enabled; initializing legacy Sui JSON-RPC client");
             Some(
                 SuiClientBuilder::default()
@@ -425,11 +427,12 @@ impl Server {
             .add_staleness_check_to_ptb(self.options.allowed_staleness, vptb.ptb().clone())?;
 
         // Evaluate the `seal_approve*` function
+        let gas_budget = MAX_COMPUTATION_UNITS * gas_price;
         let tx_data = TransactionData::new_with_gas_coins(
             TransactionKind::ProgrammableTransaction(ptb),
             sender,
             vec![], // Empty gas payment for dry run
-            GAS_BUDGET,
+            gas_budget,
             gas_price,
         );
         let simulate_res = self
