@@ -1,7 +1,6 @@
 // Copyright (c), Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::externals::{add_package, add_upgraded_package};
 use crate::key_server_options::{KeyServerOptions, RpcConfig, ServerMode};
 use crate::master_keys::MasterKeys;
 use crate::tests::KeyServerType::Open;
@@ -13,6 +12,7 @@ use crypto::ibe::public_key_from_master_key;
 use fastcrypto::ed25519::Ed25519KeyPair;
 use fastcrypto::encoding::Encoding;
 use fastcrypto::serde_helpers::ToFromByteArray;
+use key_server::sui_rpc_client::build_grpc_client;
 use key_server::sui_rpc_client::RetryConfig;
 use key_server::sui_rpc_client::SuiRpcClient;
 use move_package_alt::PackageLoader;
@@ -26,6 +26,7 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use sui_move_build::BuildConfig;
+use sui_rpc::client::Client as SuiGrpcClient;
 use sui_rpc::proto::sui::rpc::v2::GetServiceInfoRequest;
 use sui_rpc_api::client::ExecutedTransaction;
 use sui_sdk::json::SuiJsonValue;
@@ -91,6 +92,16 @@ impl ExecutedTransactionTestExt for ExecutedTransaction {
     }
 }
 
+/// Register a package as its own first version in the package id cache.
+pub(crate) fn add_package(pkg_id: ObjectID) {
+    crate::common::PACKAGE_ID_CACHE.insert(pkg_id, pkg_id);
+}
+
+/// Register an upgraded package pointing to its first version in the package id cache.
+pub(crate) fn add_upgraded_package(pkg_id: ObjectID, new_pkg_id: ObjectID) {
+    crate::common::PACKAGE_ID_CACHE.insert(new_pkg_id, pkg_id);
+}
+
 mod e2e;
 mod externals;
 mod pd;
@@ -103,6 +114,9 @@ mod test_utils;
 /// Wrapper for Sui test cluster with some Seal specific functionality.
 pub(crate) struct SealTestCluster {
     cluster: TestCluster,
+    /// Shared gRPC client for the test cluster's fullnode, built once at
+    /// cluster creation and cloned wherever tests need a client.
+    grpc_client: SuiGrpcClient,
     #[allow(dead_code)]
     pub(crate) registry: (ObjectID, ObjectID),
     pub(crate) servers: Vec<(ObjectID, Server)>,
@@ -130,9 +144,12 @@ impl SealTestCluster {
             .with_num_validators(1)
             .build()
             .await;
+        let grpc_client =
+            build_grpc_client(cluster.rpc_url()).expect("Failed to create SuiGrpcClient");
         let registry = Self::publish_internal(&cluster, module, vec![]).await;
         Self {
             cluster,
+            grpc_client,
             servers: vec![],
             registry,
             users: (0..users)
@@ -146,6 +163,11 @@ impl SealTestCluster {
 
     pub fn get_services(&self) -> Vec<ObjectID> {
         self.servers.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// Returns a clone of the shared gRPC client for the test cluster's fullnode.
+    pub fn grpc_client(&self) -> SuiGrpcClient {
+        self.grpc_client.clone()
     }
 
     /// Get a mutable reference to the [TestCluster].
@@ -195,9 +217,7 @@ impl SealTestCluster {
                 };
                 let server = Server {
                     sui_rpc_client: SuiRpcClient::new(
-                        #[allow(deprecated)]
-                        self.cluster.sui_client().clone(),
-                        self.cluster.grpc_client().into_inner(),
+                        self.grpc_client(),
                         RetryConfig::default(),
                         None,
                     ),
@@ -291,11 +311,12 @@ impl SealTestCluster {
         path: PathBuf,
         deps: Vec<(&str, ObjectID)>,
     ) -> (ObjectID, ObjectID) {
+        let mut grpc_client =
+            build_grpc_client(cluster.rpc_url()).expect("Failed to create SuiGrpcClient");
         // Use ephemeral package loader. This skips Published.toml and uses an ephemeral publication
         // file instead.
         let chain_id = {
-            let mut grpc = cluster.grpc_client().into_inner();
-            let info = grpc
+            let info = grpc_client
                 .ledger_client()
                 .get_service_info(GetServiceInfoRequest::default())
                 .await
@@ -454,8 +475,8 @@ impl SealTestCluster {
     /// Get the public keys of the key servers v2 with the given Object IDs.
     pub async fn get_public_keys(&self, object_ids: &[ObjectID]) -> Vec<ibe::PublicKey> {
         let mut pks = Vec::new();
+        let mut grpc_client = self.grpc_client();
         for id in object_ids {
-            let mut grpc_client = self.cluster.grpc_client().into_inner();
             let address = Address::new(id.into_bytes());
             let key_server_v2 = fetch_key_server_by_id(&mut grpc_client, &address)
                 .await

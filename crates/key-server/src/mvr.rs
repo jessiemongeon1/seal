@@ -13,15 +13,18 @@
 //! * A valid name is of the form `subname@name/mvr-app` or, equivalently, `subname.name.sui/mvr-app`. The subname is optional, but there is always an `/` in the name, meaning that it is not possible to register an object ID like `0xe8417c530cde59eddf6dfb760e8a0e3e2c6f17c69ddaab5a73dd6a6e65fc463b` as an MVR name.
 //! * The app record and package info objects point to the package address that was used when the name was registered, but there could be more recent versions of the package.
 
+use crate::cache::default_lru_cache;
 use crate::errors::InternalError;
 use crate::errors::InternalError::{Failure, InvalidMVRName, InvalidPackage};
 use crate::key_server_options::KeyServerOptions;
 use crate::types::Network;
 use key_server::sui_rpc_client::SuiRpcClient;
+use moka::sync::Cache;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::identifier::Identifier;
 use move_core_types::language_storage::StructTag;
 use mvr_types::name::{Name, VersionedName};
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -34,12 +37,61 @@ use sui_types::collection_types::Table;
 use sui_types::dynamic_field::{DynamicFieldName, Field};
 use sui_types::TypeTag;
 use tonic::Code;
+use tracing::debug;
 
 const MVR_REGISTRY: &str = "0xe8417c530cde59eddf6dfb760e8a0e3e2c6f17c69ddaab5a73dd6a6e65fc463b";
 const MVR_CORE: &str = "0x62c1f5b1cb9e3bfc3dd1f73c95066487b662048a6358eabdbf67f6cdeca6db4b";
 
 /// Testnet records are stored on mainnet on the registry defined above, but under the 'networks' section using the following ID as key
 const TESTNET_ID: &str = "4c78adac";
+
+static MVR_CACHE: Lazy<Cache<String, ObjectID>> = Lazy::new(default_lru_cache);
+
+/// Check that the package id that the MVR name points to matches `first_pkg_id`,
+/// if an MVR name is provided. Resolved names are cached.
+pub(crate) async fn check_mvr_package_id(
+    mvr_name: &Option<String>,
+    sui_rpc_client: &SuiRpcClient,
+    key_server_options: &KeyServerOptions,
+    first_pkg_id: ObjectID,
+    req_id: Option<&str>,
+) -> Result<(), InternalError> {
+    // If an MVR name is provided, get it from cache or resolve it to the package
+    // id. Then check that it points to the first package ID.
+    if let Some(mvr_name) = &mvr_name {
+        let mvr_package_id = match get_mvr_cache(mvr_name) {
+            None => {
+                let mvr_package_id =
+                    mvr_forward_resolution(sui_rpc_client, mvr_name, key_server_options).await?;
+                insert_mvr_cache(mvr_name, mvr_package_id);
+                mvr_package_id
+            }
+            Some(mvr_package_id) => {
+                debug!(
+                    "MVR name {} is already in cache (req_id: {:?})",
+                    mvr_name, req_id
+                );
+                mvr_package_id
+            }
+        };
+        if mvr_package_id != first_pkg_id {
+            debug!(
+                "MVR name {} points to package ID {:?} while the first package ID is {:?} (req_id: {:?})",
+                mvr_name, mvr_package_id, first_pkg_id, req_id
+            );
+            return Err(InternalError::InvalidMVRName);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn insert_mvr_cache(mvr_name: &str, package_id: ObjectID) {
+    MVR_CACHE.insert(mvr_name.to_string(), package_id);
+}
+
+pub(crate) fn get_mvr_cache(mvr_name: &str) -> Option<ObjectID> {
+    MVR_CACHE.get(&mvr_name.to_string())
+}
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct VecMap<K, V>(sui_types::collection_types::VecMap<K, V>);
@@ -110,8 +162,7 @@ pub(crate) async fn mvr_forward_resolution(
         Network::Testnet => {
             let networks: HashMap<_, _> = get_from_mvr_registry(
                 mvr_name,
-                &SuiRpcClient::new_with_optional_sui_client(
-                    None,
+                &SuiRpcClient::new(
                     SuiGrpcClient::new(Network::Mainnet.default_node_url())
                         .expect("Failed to create SuiGrpcClient"),
                     key_server_options.rpc_config.retry_config.clone(),
@@ -210,7 +261,7 @@ fn dynamic_field_name(mvr_name: &str) -> Result<DynamicFieldName, InternalError>
 mod tests {
     use crate::errors::InternalError::InvalidMVRName;
     use crate::key_server_options::KeyServerOptions;
-    use crate::mvr::mvr_forward_resolution;
+    use crate::mvr::{check_mvr_package_id, get_mvr_cache, mvr_forward_resolution};
     use crate::types::Network;
     use key_server::sui_rpc_client::RetryConfig;
     use key_server::sui_rpc_client::SuiRpcClient;
@@ -220,10 +271,9 @@ mod tests {
     use sui_types::base_types::ObjectID;
     #[tokio::test]
     async fn test_forward_resolution() {
-        assert!(crate::externals::check_mvr_package_id(
+        assert!(check_mvr_package_id(
             &Some("@mysten/kiosk".to_string()),
-            &SuiRpcClient::new_with_optional_sui_client(
-                None,
+            &SuiRpcClient::new(
                 SuiGrpcClient::new(Network::Mainnet.default_node_url()).unwrap(),
                 RetryConfig::default(),
                 None,
@@ -240,7 +290,7 @@ mod tests {
 
         // Verify the cache is added.
         assert_eq!(
-            crate::externals::get_mvr_cache("@mysten/kiosk"),
+            get_mvr_cache("@mysten/kiosk"),
             Some(
                 ObjectID::from_str(
                     "0xdfb4f1d4e43e0c3ad834dcd369f0d39005c872e118c9dc1c5da9765bb93ee5f3"
@@ -250,8 +300,7 @@ mod tests {
         );
         assert_eq!(
             mvr_forward_resolution(
-                &SuiRpcClient::new_with_optional_sui_client(
-                    None,
+                &SuiRpcClient::new(
                     SuiGrpcClient::new(Network::Testnet.default_node_url()).unwrap(),
                     RetryConfig::default(),
                     None,
@@ -270,8 +319,7 @@ mod tests {
         // This MVR name is not registered on mainnet.
         assert_eq!(
             mvr_forward_resolution(
-                &SuiRpcClient::new_with_optional_sui_client(
-                    None,
+                &SuiRpcClient::new(
                     SuiGrpcClient::new(Network::Mainnet.default_node_url())
                         .expect("Failed to create SuiGrpcClient"),
                     RetryConfig::default(),
@@ -289,8 +337,7 @@ mod tests {
         // ..but it is on testnet.
         assert_eq!(
             mvr_forward_resolution(
-                &SuiRpcClient::new_with_optional_sui_client(
-                    None,
+                &SuiRpcClient::new(
                     SuiGrpcClient::new(Network::Testnet.default_node_url())
                         .expect("Failed to create SuiGrpcClient"),
                     RetryConfig::default(),
@@ -312,8 +359,7 @@ mod tests {
     async fn test_invalid_name() {
         assert_eq!(
             mvr_forward_resolution(
-                &SuiRpcClient::new_with_optional_sui_client(
-                    None,
+                &SuiRpcClient::new(
                     SuiGrpcClient::new(Network::Mainnet.default_node_url())
                         .expect("Failed to create SuiGrpcClient"),
                     RetryConfig::default(),
@@ -330,8 +376,7 @@ mod tests {
 
         assert_eq!(
             mvr_forward_resolution(
-                &SuiRpcClient::new_with_optional_sui_client(
-                    None,
+                &SuiRpcClient::new(
                     SuiGrpcClient::new(Network::Mainnet.default_node_url())
                         .expect("Failed to create SuiGrpcClient"),
                     RetryConfig::default(),

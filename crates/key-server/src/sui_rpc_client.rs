@@ -20,12 +20,13 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use sui_rpc::client::Client as SuiGrpcClient;
 use sui_rpc::client::HeadersInterceptor;
+use sui_rpc::field::FieldMaskUtil;
 use sui_rpc::proto::sui::rpc::v2::transaction_kind::Data as TransactionKindData;
 use sui_rpc::proto::sui::rpc::v2::{
-    GetEpochRequest, GetObjectRequest, SimulateTransactionRequest, SimulateTransactionResponse,
-    Transaction,
+    Bcs, EventFilter, GetEpochRequest, GetObjectRequest, SimulateTransactionRequest,
+    SimulateTransactionResponse, SubscribeEventsRequest, SubscribeEventsResponse, Transaction,
+    UserSignature, VerifySignatureRequest,
 };
-use sui_sdk::SuiClient;
 use sui_sdk_types::Address;
 use sui_types::object::Data;
 use sui_types::transaction::TransactionData;
@@ -106,23 +107,6 @@ pub fn build_grpc_client(node_url: &str) -> RpcResult<SuiGrpcClient> {
 pub trait RetriableError {
     /// Returns true if the error is transient and the operation should be retried
     fn is_retriable_error(&self) -> bool;
-}
-
-impl RetriableError for sui_sdk::error::Error {
-    fn is_retriable_error(&self) -> bool {
-        match self {
-            // Low level networking errors are retriable.
-            // TODO: Add more retriable errors here
-            sui_sdk::error::Error::RpcError(rpc_error) => {
-                matches!(
-                    rpc_error,
-                    jsonrpsee::core::ClientError::Transport(_)
-                        | jsonrpsee::core::ClientError::RequestTimeout
-                )
-            }
-            _ => false,
-        }
-    }
 }
 
 impl RetriableError for RpcError {
@@ -228,8 +212,6 @@ fn strip_transaction(transaction: &mut Transaction) {
 /// Client for interacting with the Sui RPC API.
 #[derive(Clone)]
 pub struct SuiRpcClient {
-    /// Legacy JSON-RPC client. Only constructed when event monitoring is enabled.
-    sui_client: Option<SuiClient>,
     sui_grpc_client: SuiGrpcClient,
     rpc_retry_config: RetryConfig,
     request_duration_millis: Option<HistogramVec>,
@@ -237,43 +219,15 @@ pub struct SuiRpcClient {
 
 impl SuiRpcClient {
     pub fn new(
-        sui_client: SuiClient,
-        sui_grpc_client: SuiGrpcClient,
-        rpc_retry_config: RetryConfig,
-        request_duration_millis: Option<HistogramVec>,
-    ) -> Self {
-        Self::new_with_optional_sui_client(
-            Some(sui_client),
-            sui_grpc_client,
-            rpc_retry_config,
-            request_duration_millis,
-        )
-    }
-
-    pub fn new_with_optional_sui_client(
-        sui_client: Option<SuiClient>,
         sui_grpc_client: SuiGrpcClient,
         rpc_retry_config: RetryConfig,
         request_duration_millis: Option<HistogramVec>,
     ) -> Self {
         Self {
-            sui_client,
             sui_grpc_client,
             rpc_retry_config,
             request_duration_millis,
         }
-    }
-
-    /// Returns a clone of the underlying legacy JSON-RPC client, must be present.
-    pub fn sui_client(&self) -> SuiClient {
-        self.sui_client.clone().expect(
-            "Legacy Sui JSON-RPC client must be initialized when event monitoring is enabled",
-        )
-    }
-
-    /// Returns a reference to the underlying gRPC client.
-    pub fn sui_grpc_client(&self) -> SuiGrpcClient {
-        self.sui_grpc_client.clone()
     }
 
     /// Returns a clone of the request-duration histogram (if any).
@@ -311,7 +265,14 @@ impl SuiRpcClient {
         &self,
         tx_data: TransactionData,
     ) -> RpcResult<SimulateTransactionResponse> {
-        let mut transaction = Transaction::from(tx_data);
+        // `sui_types::TransactionData` and `sui_sdk_types::Transaction` are
+        // BCS-compatible; round-trip through BCS to bridge the two crates.
+        let sdk_transaction: sui_sdk_types::Transaction = bcs::from_bytes(
+            &bcs::to_bytes(&tx_data)
+                .map_err(|e| RpcError::new(&format!("Failed to serialize transaction: {e}")))?,
+        )
+        .map_err(|e| RpcError::new(&format!("Failed to convert transaction: {e}")))?;
+        let mut transaction = Transaction::from(sdk_transaction);
 
         // Clear bcs and the version/digest of each input object so the fullnode
         // resolves inputs against current chain state during simulation.
@@ -337,6 +298,47 @@ impl SuiRpcClient {
             }
         })
         .await
+    }
+
+    /// Verifies a personal message signature via the fullnode's gRPC
+    /// `SignatureVerificationService`.
+    pub async fn verify_personal_message_signature(
+        &self,
+        message: &[u8],
+        signature: &[u8],
+        address: String,
+    ) -> RpcResult<()> {
+        let message_bcs = Bcs::serialize(&message)
+            .map_err(|e| RpcError::new(&format!("Failed to serialize message: {e}")))?
+            .with_name("PersonalMessage");
+
+        let request = VerifySignatureRequest::default()
+            .with_message(message_bcs)
+            .with_signature(UserSignature::default().with_bcs(signature.to_vec()))
+            .with_address(address);
+
+        let response = self
+            .run_grpc_with_retries("verify_signature", move |mut grpc_client| {
+                let request = request.clone();
+                async move {
+                    grpc_client
+                        .signature_verification_client()
+                        .verify_signature(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(RpcError::from_grpc)
+                }
+            })
+            .await?;
+
+        if response.is_valid() {
+            Ok(())
+        } else {
+            Err(RpcError::new(&format!(
+                "Invalid signature: {}",
+                response.reason()
+            )))
+        }
     }
 
     /// Fetches a Move object via gRPC and deserializes its contents as type T.
@@ -469,6 +471,32 @@ impl SuiRpcClient {
                 }
             },
         )
+        .await
+    }
+
+    /// Subscribes to events matching `filter` via the fullnode's gRPC event
+    /// subscription and returns the response stream. `read_mask_paths` selects
+    /// the `Event` fields present on each frame.
+    pub async fn subscribe_events(
+        &self,
+        filter: EventFilter,
+        read_mask_paths: &[&str],
+    ) -> RpcResult<tonic::Streaming<SubscribeEventsResponse>> {
+        let request = SubscribeEventsRequest::default()
+            .with_read_mask(FieldMask::from_paths(read_mask_paths))
+            .with_filter(filter);
+
+        self.run_grpc_with_retries("subscribe_events", move |mut grpc_client| {
+            let request = request.clone();
+            async move {
+                grpc_client
+                    .subscription_client()
+                    .subscribe_events(request)
+                    .await
+                    .map(|r| r.into_inner())
+                    .map_err(RpcError::from_grpc)
+            }
+        })
         .await
     }
 
