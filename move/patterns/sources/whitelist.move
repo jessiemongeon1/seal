@@ -75,6 +75,8 @@ public fun add(wl: &mut Whitelist, cap: &Cap, account: address) {
     wl.addresses.add(account, true);
 }
 
+/// Removing an address only blocks future key derivations - keys it already fetched keep
+/// working, including for content encrypted later. See the note on `seal_approve`.
 public fun remove(wl: &mut Whitelist, cap: &Cap, account: address) {
     assert!(cap.wl_id == object::id(wl), EInvalidCap);
     assert!(wl.addresses.contains(account), ENotInWhitelist);
@@ -111,6 +113,32 @@ fun check_policy(caller: address, id: vector<u8>, wl: &Whitelist): bool {
     wl.addresses.contains(caller)
 }
 
+/// Note: the key for a given id is fixed, and once a user fetches it, the user may store
+/// it and use it for future decryptions. This function approves any id with the
+/// whitelist's prefix, so a whitelisted user can fetch keys for such ids, and removing
+/// the user later does not take those keys back (see `remove`).
+///
+/// The developer should decide whether future encryptions can or must not be decryptable
+/// with previously fetched keys, and based on that encrypt them to the same or to
+/// different key ids. In this pattern the nonce can be used for creating unique key ids,
+/// for example:
+/// - A random nonce per encryption: each key covers a single piece of content, and future
+///   ids are unguessable, so keys cannot be pre-fetched for content that does not exist
+///   yet. Avoid predictable nonces such as a counter or timestamp: a user can enumerate
+///   future ids and pre-fetch their keys before being removed.
+/// - A revocation version: the Whitelist stores a version, `remove` bumps it, and this
+///   function checks that the id carries the current value. Previously fetched keys then
+///   stop working for content encrypted to the new version, at the cost of encryptors
+///   reading the current version onchain before each encryption.
+/// - A time bucket (e.g., the current epoch or date): keys rotate on a schedule, so a
+///   removal takes effect at the next bucket without an onchain bump.
+/// - An identifier of the content itself (e.g., a Walrus blob id): each key is scoped to
+///   exactly that content.
+///
+/// The nonce is only one option. Alternatives include checking the full key id against an
+/// onchain object so ids cannot be pre-fetched at all (see private_data.move), or using a
+/// single fixed id for the whole policy when sharing one key is acceptable (see
+/// account_based.move and tle.move).
 entry fun seal_approve(id: vector<u8>, wl: &Whitelist, ctx: &TxContext) {
     assert!(check_policy(ctx.sender(), id, wl), ENoAccess);
 }
