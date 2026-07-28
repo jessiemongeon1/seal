@@ -8,7 +8,7 @@
 use prometheus::HistogramVec;
 use prost_types::FieldMask;
 use seal_committee::grpc_helper::{
-    extract_object, fetch_committee_from_key_server as grpc_fetch_committee_from_key_server,
+    fetch_committee_from_key_server as grpc_fetch_committee_from_key_server,
     fetch_key_server_by_id as grpc_fetch_key_server_by_id, fetch_object as grpc_fetch_object,
     fetch_upgrade_proposal as grpc_fetch_upgrade_proposal,
 };
@@ -23,13 +23,12 @@ use sui_rpc::client::HeadersInterceptor;
 use sui_rpc::field::FieldMaskUtil;
 use sui_rpc::proto::sui::rpc::v2::transaction_kind::Data as TransactionKindData;
 use sui_rpc::proto::sui::rpc::v2::{
-    Bcs, EventFilter, GetEpochRequest, GetObjectRequest, SimulateTransactionRequest,
-    SimulateTransactionResponse, SubscribeEventsRequest, SubscribeEventsResponse, Transaction,
-    UserSignature, VerifySignatureRequest,
+    Bcs, EventFilter, GetEpochRequest, GetObjectRequest, GetPackageRequest,
+    ListPackageVersionsRequest, SimulateTransactionRequest, SimulateTransactionResponse,
+    SubscribeEventsRequest, SubscribeEventsResponse, Transaction, UserSignature,
+    VerifySignatureRequest,
 };
 use sui_sdk_types::Address;
-use sui_types::object::Data;
-use sui_types::transaction::TransactionData;
 
 /// Configuration for the retry logic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,16 +264,9 @@ impl SuiRpcClient {
     /// Simulates a transaction block via gRPC.
     pub async fn simulate_transaction(
         &self,
-        tx_data: TransactionData,
+        transaction: sui_sdk_types::Transaction,
     ) -> RpcResult<SimulateTransactionResponse> {
-        // `sui_types::TransactionData` and `sui_sdk_types::Transaction` are
-        // BCS-compatible; round-trip through BCS to bridge the two crates.
-        let sdk_transaction: sui_sdk_types::Transaction = bcs::from_bytes(
-            &bcs::to_bytes(&tx_data)
-                .map_err(|e| RpcError::new(&format!("Failed to serialize transaction: {e}")))?,
-        )
-        .map_err(|e| RpcError::new(&format!("Failed to convert transaction: {e}")))?;
-        let mut transaction = Transaction::from(sdk_transaction);
+        let mut transaction = Transaction::from(transaction);
 
         // Clear bcs and the version/digest of each input object so the fullnode
         // resolves inputs against current chain state during simulation.
@@ -428,9 +420,7 @@ impl SuiRpcClient {
         self.run_grpc_with_retries(
             "fetch_committee_from_key_server",
             move |mut grpc| async move {
-                let (committee_id, pkg_id) =
-                    grpc_fetch_committee_from_key_server(&mut grpc, &ks_obj_id).await?;
-                Ok((committee_id, Address::new(pkg_id.into_bytes())))
+                grpc_fetch_committee_from_key_server(&mut grpc, &ks_obj_id).await
             },
         )
         .await
@@ -453,26 +443,53 @@ impl SuiRpcClient {
         self.run_grpc_with_retries(
             "fetch_package_original_id",
             move |mut grpc_client| async move {
-                let mut request = GetObjectRequest::default();
-                request.object_id = Some(package_id.to_string());
-                request.read_mask = Some(FieldMask {
-                    paths: vec!["bcs".to_string()],
-                });
+                let mut request = GetPackageRequest::default();
+                request.package_id = Some(package_id.to_string());
 
                 let response = grpc_client
-                    .ledger_client()
-                    .get_object(request)
+                    .package_client()
+                    .get_package(request)
                     .await
                     .map(|r| r.into_inner())
                     .map_err(RpcError::from_grpc)?;
 
-                let obj = extract_object(response).map_err(|_| RpcError::new("Invalid package"))?;
-                match &obj.data {
-                    Data::Package(p) => Ok(Address::new(p.original_package_id().into_bytes())),
-                    _ => Err(RpcError::new("Invalid package")),
-                }
+                response
+                    .package
+                    .as_ref()
+                    .and_then(|pkg| pkg.original_id.as_ref())
+                    .ok_or_else(|| RpcError::new("Invalid package"))
+                    .and_then(|id| {
+                        Address::from_hex(id).map_err(|_| RpcError::new("Invalid package"))
+                    })
             },
         )
+        .await
+    }
+
+    /// Resolves the latest version's package id for the package identified by
+    /// `package_id`. Useful to determine event type.
+    pub async fn fetch_latest_package_id(&self, package_id: Address) -> RpcResult<Address> {
+        self.run_grpc_with_retries("list_package_versions", move |mut grpc_client| async move {
+            let mut request = ListPackageVersionsRequest::default();
+            request.package_id = Some(package_id.to_string());
+
+            let response = grpc_client
+                .package_client()
+                .list_package_versions(request)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(RpcError::from_grpc)?;
+
+            response
+                .versions
+                .iter()
+                .max_by_key(|v| v.version)
+                .and_then(|v| v.package_id.as_deref())
+                .ok_or_else(|| RpcError::new("No package versions found"))
+                .and_then(|id| {
+                    Address::from_hex(id).map_err(|_| RpcError::new("Invalid package id"))
+                })
+        })
         .await
     }
 
@@ -858,5 +875,43 @@ mod tests {
             elapsed >= timeout && elapsed < Duration::from_secs(10),
             "expected the call to fail after ~{timeout:?}, took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_package_id() {
+        use super::{build_grpc_client, RetryConfig, SuiRpcClient};
+        use sui_sdk_types::Address;
+
+        let sui_rpc_client = SuiRpcClient::new(
+            build_grpc_client(
+                "https://fullnode.testnet.sui.io:443",
+                Duration::from_secs(30),
+            )
+            .expect("Failed to create SuiGrpcClient"),
+            RetryConfig::default(),
+            None,
+        );
+
+        // Original (version 1) id of the testnet seal committee package.
+        let original = Address::from_static(
+            "0x126586d3e92768327831077f315e160728115d469a8c7b89493218be911e7908",
+        );
+        // Upgraded (version 2) id, where CommitteeRotationInitiated was added.
+        let upgraded = Address::from_static(
+            "0xb0a65ffc4d4a460a78a347f494b6be72f76e7286fb59ad52ca03c799df259611",
+        );
+
+        let latest = sui_rpc_client
+            .fetch_latest_package_id(original)
+            .await
+            .unwrap();
+        assert_eq!(latest, upgraded);
+
+        // Resolving from the upgraded id yields the same result.
+        let latest = sui_rpc_client
+            .fetch_latest_package_id(upgraded)
+            .await
+            .unwrap();
+        assert_eq!(latest, upgraded);
     }
 }
